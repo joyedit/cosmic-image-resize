@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""COSMIC Files context action: batch resize / shrink images, replacing them in place.
+
+Invoked from the right-click menu via ~/.config/cosmic/com.system76.CosmicFiles/v1/context_actions
+with one or more file paths. Shows a zenity picker, then rewrites each selected image.
+
+Originals are moved to the trash (gio trash) before being replaced, so a bad batch
+is always recoverable.
+
+Depends only on: ImageMagick 6 (convert/identify), zenity, gio, notify-send.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+APP_NAME = "Resize / Compress Images"
+
+# key, menu label
+PRESETS = [
+    ("3440x1440", "3440 × 1440      —  fit, keeps aspect"),
+    ("1024x768", "1024 × 768        —  fit, keeps aspect"),
+    ("512x512", "512 × 512          —  square, center crop"),
+    ("480x480", "480 × 480          —  square, center crop"),
+    ("256x256", "256 × 256          —  square, center crop"),
+    ("128x128", "128 × 128          —  square, center crop"),
+    ("square", "Square 1:1          —  center crop, keep size"),
+    ("size20", "Shrink file size   − 20 %"),
+    ("size40", "Shrink file size   − 40 %"),
+    ("size60", "Shrink file size   − 60 %"),
+]
+
+IMAGE_SUFFIXES = {
+    ".jpg", ".jpeg", ".jpe", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+    ".avif", ".heic", ".heif", ".ppm", ".pgm", ".pnm", ".tga", ".ico", ".jxl",
+}
+
+# ImageMagick orientations where the stored width/height are swapped on display.
+SWAPPED_ORIENTATIONS = {"LeftTop", "RightTop", "RightBottom", "LeftBottom"}
+
+LOSSY_FORMATS = {"JPEG", "JPG", "WEBP", "AVIF", "HEIC", "JXL"}
+
+MIN_QUALITY = 15
+MAX_QUALITY = 95
+MIN_SCALE = 10
+COLOR_LADDER = [256, 128, 64, 32, 16]
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def notify(summary, body="", urgency="normal"):
+    subprocess.run(
+        ["notify-send", "-a", APP_NAME, "-u", urgency, "-i",
+         "image-x-generic", summary, body],
+        capture_output=True,
+    )
+
+
+def error_dialog(text):
+    subprocess.run(
+        ["zenity", "--error", "--width=380", f"--title={APP_NAME}", f"--text={text}"],
+        capture_output=True,
+    )
+
+
+def identify_info(path):
+    """Return (format, display_width, display_height) or None if not an image."""
+    proc = run(["identify", "-format", "%m|%w|%h|%[orientation]\\n", path])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    first = proc.stdout.strip().splitlines()[0]
+    parts = first.split("|")
+    if len(parts) < 3:
+        return None
+    try:
+        fmt, w, h = parts[0].upper(), int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    orientation = parts[3] if len(parts) > 3 else ""
+    if orientation in SWAPPED_ORIENTATIONS:
+        w, h = h, w
+    return fmt, w, h
+
+
+def collect_images(paths):
+    images, skipped = [], []
+    for p in paths:
+        if not os.path.isfile(p):
+            continue
+        if os.path.splitext(p)[1].lower() not in IMAGE_SUFFIXES:
+            skipped.append(p)
+            continue
+        info = identify_info(p)
+        if info is None:
+            skipped.append(p)
+            continue
+        images.append((p, info))
+    return images, skipped
+
+
+def ask_preset(count):
+    rows = []
+    for i, (key, label) in enumerate(PRESETS):
+        rows += ["TRUE" if i == 0 else "FALSE", key, label]
+    noun = "image" if count == 1 else "images"
+    proc = subprocess.run(
+        [
+            "zenity", "--list", "--radiolist",
+            f"--title={APP_NAME}",
+            f"--text=Replacing {count} {noun} in place. Originals go to the trash.",
+            "--column=", "--column=key", "--column=Action",
+            "--hide-column=2", "--print-column=2",
+            "--width=480", "--height=430",
+        ] + rows,
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip().split("|")[0] or None
+
+
+def geometry_ops(key, w, h):
+    """Convert ops for a resolution preset. Returns None if nothing to do."""
+    if key == "square":
+        side = min(w, h)
+        if w == h:
+            return None
+        return ["-auto-orient", "-gravity", "center",
+                "-crop", f"{side}x{side}+0+0", "+repage"]
+
+    tw, th = (int(v) for v in key.split("x"))
+    if tw == th:
+        # Square target: center-crop to fill, but never upscale.
+        side = min(tw, w, h)
+        return ["-auto-orient", "-resize", f"{side}x{side}^",
+                "-gravity", "center", "-extent", f"{side}x{side}", "+repage"]
+    # Non-square target: fit inside, shrink-only ('>' suffix).
+    return ["-auto-orient", "-resize", f"{tw}x{th}>"]
+
+
+def encode(src, dst, ops):
+    proc = run(["convert", src] + ops + [dst])
+    if proc.returncode != 0 or not os.path.exists(dst):
+        return None
+    return os.path.getsize(dst)
+
+
+def shrink_to_target(src, dst, fmt, target, scratch):
+    """Re-encode src so it lands at or under `target` bytes. Returns final size or None."""
+    lossy = fmt in LOSSY_FORMATS
+
+    def ops_for(quality=None, colors=None, scale=None):
+        ops = ["-auto-orient", "-strip"]
+        if scale is not None:
+            ops += ["-resize", f"{scale}%"]
+        if colors is not None:
+            ops += ["-colors", str(colors)]
+        if quality is not None:
+            ops += ["-quality", str(quality)]
+        elif fmt == "PNG":
+            ops += ["-define", "png:compression-level=9"]
+        return ops
+
+    def try_ops(**kw):
+        return encode(src, scratch, ops_for(**kw))
+
+    def search_scale(**base):
+        """Largest downscale percentage that still meets the byte target."""
+        lo, hi, best = MIN_SCALE, 99, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            size = try_ops(scale=mid, **base)
+            if size is not None and size <= target:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    if lossy:
+        # Binary-search the highest quality that still meets the byte target.
+        lo, hi, best_q = MIN_QUALITY, MAX_QUALITY, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            size = try_ops(quality=mid)
+            if size is not None and size <= target:
+                best_q, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if best_q is not None:
+            return encode(src, dst, ops_for(quality=best_q))
+        # Even minimum quality is too big: shrink pixels on top of it.
+        base = {"quality": MIN_QUALITY}
+        scale = search_scale(**base) or MIN_SCALE
+        return encode(src, dst, ops_for(scale=scale, **base))
+
+    # Lossless formats. Strip + max compression first; if that misses, downscale,
+    # which is finely tunable and keeps full colour. Crush the palette only as a
+    # last resort, since it overshoots the target badly on photographic images.
+    size = try_ops()
+    if size is not None and size <= target:
+        return encode(src, dst, ops_for())
+    scale = search_scale()
+    if scale is not None:
+        return encode(src, dst, ops_for(scale=scale))
+    for colors in COLOR_LADDER:
+        size = try_ops(scale=MIN_SCALE, colors=colors)
+        if size is not None and size <= target:
+            return encode(src, dst, ops_for(scale=MIN_SCALE, colors=colors))
+    return encode(src, dst, ops_for(scale=MIN_SCALE, colors=COLOR_LADDER[-1]))
+
+
+def replace_in_place(path, tmp):
+    """Trash the original, then move tmp into its place. Returns True on success."""
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+    proc = run(["gio", "trash", "--", path])
+    if proc.returncode != 0:
+        return False
+    try:
+        shutil.move(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def process(path, info, key, scratch_dir):
+    """Rewrite one image. Returns (status, detail) where status is done/skipped/failed."""
+    fmt, w, h = info
+    orig_size = os.path.getsize(path)
+    directory, name = os.path.split(path)
+    ext = os.path.splitext(name)[1] or ".img"
+
+    fd, tmp = tempfile.mkstemp(prefix=".imgresize-", suffix=ext, dir=directory)
+    os.close(fd)
+    scratch = os.path.join(scratch_dir, "probe" + ext)
+
+    try:
+        if key.startswith("size"):
+            pct = int(key[4:])
+            target = int(orig_size * (100 - pct) / 100)
+            new_size = shrink_to_target(path, tmp, fmt, target, scratch)
+            if new_size is None:
+                return "failed", "could not re-encode"
+            if new_size >= orig_size:
+                return "skipped", "already smaller than the target"
+            reached = new_size <= target
+            if not replace_in_place(path, tmp):
+                return "failed", "could not move original to trash"
+            detail = f"{human(orig_size)} → {human(new_size)}"
+            if not reached:
+                detail += " (best effort)"
+            return "done", detail
+
+        ops = geometry_ops(key, w, h)
+        if ops is None:
+            return "skipped", "already square"
+        new_size = encode(path, tmp, ops)
+        if new_size is None:
+            return "failed", "convert failed"
+        new_info = identify_info(tmp)
+        if new_info is None:
+            return "failed", "unreadable output"
+        _, nw, nh = new_info
+        if (nw, nh) == (w, h):
+            # Nothing to gain, and re-encoding would only lose quality.
+            return "skipped", "already at or below that size"
+        if not replace_in_place(path, tmp):
+            return "failed", "could not move original to trash"
+        return "done", f"{w}×{h} → {nw}×{nh}, {human(new_size)}"
+    finally:
+        for leftover in (tmp, scratch):
+            if os.path.exists(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+
+
+def main():
+    paths = sys.argv[1:]
+    if not paths:
+        error_dialog("No files were passed to the image resizer.")
+        return 1
+
+    images, skipped = collect_images(paths)
+    if not images:
+        error_dialog("None of the selected files are images ImageMagick can read.")
+        return 1
+
+    key = ask_preset(len(images))
+    if not key:
+        return 0
+
+    label = dict(PRESETS).get(key, key)
+    total = len(images)
+    results = {"done": [], "skipped": [], "failed": []}
+
+    progress = subprocess.Popen(
+        ["zenity", "--progress", "--auto-close", "--width=440",
+         f"--title={APP_NAME}", "--text=Starting…", "--percentage=0"],
+        stdin=subprocess.PIPE, text=True,
+    )
+
+    def report(pct, text):
+        if progress.poll() is not None:
+            return False
+        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        try:
+            progress.stdin.write(f"#{safe}\n{pct}\n")
+            progress.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            return False
+        return True
+
+    cancelled = False
+    with tempfile.TemporaryDirectory(prefix="cosmic-image-resize-") as scratch_dir:
+        for i, (path, info) in enumerate(images):
+            name = os.path.basename(path)
+            if not report(int(i * 100 / total), f"{name}  ({i + 1} of {total})"):
+                cancelled = True
+                break
+            try:
+                status, detail = process(path, info, key, scratch_dir)
+            except Exception as exc:  # keep the batch going on one bad file
+                status, detail = "failed", str(exc)
+            results[status].append((os.path.basename(path), detail))
+
+    report(100, "Finished")
+    if progress.poll() is None:
+        try:
+            progress.stdin.close()
+        except (BrokenPipeError, ValueError):
+            pass
+    progress.wait()
+
+    done, skip, fail = (len(results[k]) for k in ("done", "skipped", "failed"))
+    parts = [f"{done} updated"]
+    if skip:
+        parts.append(f"{skip} skipped")
+    if fail:
+        parts.append(f"{fail} failed")
+    if skipped:
+        parts.append(f"{len(skipped)} not images")
+    if cancelled:
+        parts.append("cancelled")
+
+    lines = [f"{label.strip()}", ", ".join(parts)]
+    for name, detail in (results["failed"] + results["skipped"])[:5]:
+        lines.append(f"{name}: {detail}")
+    notify(APP_NAME, "\n".join(lines), "critical" if fail else "normal")
+    return 1 if fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

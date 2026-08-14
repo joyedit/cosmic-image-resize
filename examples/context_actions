@@ -1,0 +1,13 @@
+// COSMIC Files context actions.
+// Install to: ~/.config/cosmic/com.system76.CosmicFiles/v1/context_actions
+// Replace the path below with your own home directory (install.sh does this for you).
+[
+    (
+        name: "Resize / Compress Images…",
+        confirm: false,
+        selection: Files,
+        steps: [
+            "/home/YOUR_USER/.local/bin/cosmic-image-resize %F",
+        ],
+    ),
+]
