@@ -15,8 +15,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "Resize / Compress Images"
+
+# Images are processed concurrently: every step shells out to ImageMagick, so the
+# work happens in subprocesses and threads only wait on them. JPEG encoding is
+# single-threaded inside ImageMagick, which is why spreading files across cores
+# matters far more than letting one convert have every core.
+CPU_COUNT = os.cpu_count() or 4
+MAX_WORKERS = max(1, CPU_COUNT)
 
 # key, menu label
 PRESETS = [
@@ -75,8 +84,12 @@ def error_dialog(text):
 
 
 def identify_info(path):
-    """Return (format, display_width, display_height) or None if not an image."""
-    proc = run(["identify", "-format", "%m|%w|%h|%[orientation]\\n", path])
+    """Return (format, display_width, display_height) or None if not an image.
+
+    -ping reads the header only, which is ~20x faster than decoding the pixels
+    and still reports the EXIF orientation we need.
+    """
+    proc = run(["identify", "-ping", "-format", "%m|%w|%h|%[orientation]\\n", path])
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     first = proc.stdout.strip().splitlines()[0]
@@ -94,18 +107,26 @@ def identify_info(path):
 
 
 def collect_images(paths):
-    images, skipped = [], []
-    for p in paths:
-        if not os.path.isfile(p):
-            continue
-        if os.path.splitext(p)[1].lower() not in IMAGE_SUFFIXES:
-            skipped.append(p)
-            continue
-        info = identify_info(p)
+    candidates = [
+        p for p in paths
+        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in IMAGE_SUFFIXES
+    ]
+    skipped = [p for p in paths if os.path.isfile(p) and p not in set(candidates)]
+
+    if not candidates:
+        return [], skipped
+
+    # Probing headers is IO-bound, so run it across threads too.
+    workers = max(1, min(MAX_WORKERS, len(candidates)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        infos = list(pool.map(identify_info, candidates))
+
+    images = []
+    for p, info in zip(candidates, infos):
         if info is None:
             skipped.append(p)
-            continue
-        images.append((p, info))
+        else:
+            images.append((p, info))
     return images, skipped
 
 
@@ -156,9 +177,16 @@ def encode(src, dst, ops):
     return os.path.getsize(dst)
 
 
-def shrink_to_target(src, dst, fmt, target, scratch):
-    """Re-encode src so it lands at or under `target` bytes. Returns final size or None."""
+def shrink_to_target(src, dst, fmt, target, scratch, probe_pool=None):
+    """Re-encode src so it lands at or under `target` bytes. Returns final size or None.
+
+    `probe_pool` is an optional ThreadPoolExecutor. When the batch is small enough
+    that spreading files across cores leaves cores idle, the search probes several
+    candidates at once instead of walking them one at a time.
+    """
     lossy = fmt in LOSSY_FORMATS
+    counter = [0]
+    lock = threading.Lock()
 
     def ops_for(quality=None, colors=None, scale=None):
         ops = ["-auto-orient", "-strip"]
@@ -173,30 +201,83 @@ def shrink_to_target(src, dst, fmt, target, scratch):
         return ops
 
     def try_ops(**kw):
-        return encode(src, scratch, ops_for(**kw))
+        # Each probe needs its own scratch file so concurrent probes cannot
+        # overwrite one another's output before it is measured.
+        with lock:
+            counter[0] += 1
+            n = counter[0]
+        root, ext = os.path.splitext(scratch)
+        path = f"{root}-{n}{ext}"
+        try:
+            return encode(src, path, ops_for(**kw))
+        finally:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
-    def search_scale(**base):
-        """Largest downscale percentage that still meets the byte target."""
-        lo, hi, best = MIN_SCALE, 99, None
-        while lo <= hi:
+    def search(param, lo, hi, **base):
+        """Largest value of `param` in [lo, hi] whose encoding meets the target.
+
+        Encoded size rises monotonically with both quality and scale, so the
+        predicate "meets the target" is true up to some cut-off and false above
+        it. Sequentially that is a plain bisection. With spare cores we instead
+        probe a spread of candidates per round, which collapses the range by a
+        factor of (fan + 1) per round for the same wall-clock cost as one probe.
+        """
+        cache = {}
+        fan = 0 if probe_pool is None else max(1, probe_pool._max_workers)
+
+        def size_at(x):
+            if x not in cache:
+                cache[x] = try_ops(**{param: x}, **base)
+            return cache[x]
+
+        def meets(x):
+            s = size_at(x)
+            return s is not None and s <= target
+
+        if not meets(lo):
+            return None          # even the smallest setting overshoots
+        if meets(hi):
+            return hi            # nothing needs giving up
+
+        best = lo
+        while hi - lo > 1:
+            if fan > 1:
+                width = min(fan, hi - lo - 1)
+                step = (hi - lo) / (width + 1)
+                cands = sorted({int(round(lo + step * (i + 1))) for i in range(width)})
+                cands = [c for c in cands if lo < c < hi]
+                if not cands:
+                    break
+                missing = [c for c in cands if c not in cache]
+                if missing:
+                    for c, s in zip(missing, probe_pool.map(
+                            lambda v: try_ops(**{param: v}, **base), missing)):
+                        cache[c] = s
+                for c in cands:            # ascending; true-run then false-run
+                    if meets(c):
+                        lo = best = c
+                    else:
+                        hi = c
+                        break
+                else:
+                    lo = cands[-1]
+                continue
             mid = (lo + hi) // 2
-            size = try_ops(scale=mid, **base)
-            if size is not None and size <= target:
-                best, lo = mid, mid + 1
+            if meets(mid):
+                lo = best = mid
             else:
-                hi = mid - 1
+                hi = mid
         return best
 
+    def search_scale(**base):
+        return search("scale", MIN_SCALE, 99, **base)
+
     if lossy:
-        # Binary-search the highest quality that still meets the byte target.
-        lo, hi, best_q = MIN_QUALITY, MAX_QUALITY, None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            size = try_ops(quality=mid)
-            if size is not None and size <= target:
-                best_q, lo = mid, mid + 1
-            else:
-                hi = mid - 1
+        best_q = search("quality", MIN_QUALITY, MAX_QUALITY)
         if best_q is not None:
             return encode(src, dst, ops_for(quality=best_q))
         # Even minimum quality is too big: shrink pixels on top of it.
@@ -237,7 +318,7 @@ def replace_in_place(path, tmp):
     return True
 
 
-def process(path, info, key, scratch_dir):
+def process(path, info, key, scratch_dir, probe_pool=None):
     """Rewrite one image. Returns (status, detail) where status is done/skipped/failed."""
     fmt, w, h = info
     orig_size = os.path.getsize(path)
@@ -246,13 +327,16 @@ def process(path, info, key, scratch_dir):
 
     fd, tmp = tempfile.mkstemp(prefix=".imgresize-", suffix=ext, dir=directory)
     os.close(fd)
-    scratch = os.path.join(scratch_dir, "probe" + ext)
+    # Unique per image: several images are in flight at once.
+    fd, scratch = tempfile.mkstemp(prefix="probe-", suffix=ext, dir=scratch_dir)
+    os.close(fd)
+    os.remove(scratch)
 
     try:
         if key.startswith("size"):
             pct = int(key[4:])
             target = int(orig_size * (100 - pct) / 100)
-            new_size = shrink_to_target(path, tmp, fmt, target, scratch)
+            new_size = shrink_to_target(path, tmp, fmt, target, scratch, probe_pool)
             if new_size is None:
                 return "failed", "could not re-encode"
             if new_size >= orig_size:
@@ -315,29 +399,63 @@ def main():
         stdin=subprocess.PIPE, text=True,
     )
 
+    report_lock = threading.Lock()
+
     def report(pct, text):
         if progress.poll() is not None:
             return False
         safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        try:
-            progress.stdin.write(f"#{safe}\n{pct}\n")
-            progress.stdin.flush()
-        except (BrokenPipeError, ValueError):
-            return False
+        with report_lock:
+            try:
+                progress.stdin.write(f"#{safe}\n{pct}\n")
+                progress.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                return False
         return True
 
-    cancelled = False
-    with tempfile.TemporaryDirectory(prefix="cosmic-image-resize-") as scratch_dir:
-        for i, (path, info) in enumerate(images):
-            name = os.path.basename(path)
-            if not report(int(i * 100 / total), f"{name}  ({i + 1} of {total})"):
-                cancelled = True
-                break
-            try:
-                status, detail = process(path, info, key, scratch_dir)
-            except Exception as exc:  # keep the batch going on one bad file
-                status, detail = "failed", str(exc)
+    workers = max(1, min(MAX_WORKERS, total))
+    # Cores left over once every file has a worker go into probing several
+    # settings at once inside each file. With more files than cores this is 1,
+    # so a saturated machine does the cheaper sequential bisection instead of
+    # burning extra encodes it has no spare capacity to absorb. Capped because
+    # past ~8 concurrent encodes the gain flattens and memory use keeps rising.
+    spare = max(1, min(8, CPU_COUNT // workers))
+    # Budget ImageMagick's own threads against the total number of converts we
+    # may have in flight (workers x probes), not just the file count, or a
+    # single-image run fans out 8 probes that each grab every core.
+    os.environ["MAGICK_THREAD_LIMIT"] = str(max(1, CPU_COUNT // (workers * spare)))
+
+    cancelled = threading.Event()
+    finished = [0]
+    results_lock = threading.Lock()
+
+    def worker(item, probe_pool):
+        path, info = item
+        if cancelled.is_set():
+            return
+        try:
+            status, detail = process(path, info, key, worker.scratch_dir, probe_pool)
+        except Exception as exc:  # keep the batch going on one bad file
+            status, detail = "failed", str(exc)
+        with results_lock:
             results[status].append((os.path.basename(path), detail))
+            finished[0] += 1
+            n = finished[0]
+        if not report(int(n * 100 / total), f"{os.path.basename(path)}  ({n} of {total})"):
+            cancelled.set()
+
+    with tempfile.TemporaryDirectory(prefix="cosmic-image-resize-") as scratch_dir:
+        worker.scratch_dir = scratch_dir
+        report(0, f"Processing {total} image{'s' if total != 1 else ''} on {workers} core{'s' if workers != 1 else ''}…")
+        probe_pool = None
+        if spare > 1:
+            probe_pool = ThreadPoolExecutor(max_workers=spare)
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(lambda it: worker(it, probe_pool), images))
+        finally:
+            if probe_pool is not None:
+                probe_pool.shutdown(wait=True)
 
     report(100, "Finished")
     if progress.poll() is None:
@@ -355,7 +473,7 @@ def main():
         parts.append(f"{fail} failed")
     if skipped:
         parts.append(f"{len(skipped)} not images")
-    if cancelled:
+    if cancelled.is_set():
         parts.append("cancelled")
 
     lines = [f"{label.strip()}", ", ".join(parts)]

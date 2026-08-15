@@ -98,6 +98,44 @@ an exact hit, and the strategy differs by format:
 If you would rather PNGs kept their resolution and gave up colour depth instead, swap the
 order of the two branches in `shrink_to_target()`.
 
+## Performance
+
+Every step shells out to ImageMagick, so the work happens in subprocesses and the
+script only waits on them. Images are therefore processed concurrently, sized to
+your core count. This matters because JPEG encoding is single-threaded inside
+ImageMagick — handing one `convert` every core does almost nothing, while
+spreading files across cores scales nearly linearly.
+
+Measured on a 32-thread i9-14900KF, batches of 4000×3000 JPEGs:
+
+| Batch | Before | After | |
+| --- | --- | --- | --- |
+| 30 images → `1024 × 768` | 7.01 s | **0.44 s** | 16× |
+| 30 images → `− 40 %` | 40.84 s | **2.96 s** | 13.8× |
+| 7 mixed (incl. a 30 MB PNG) → `− 40 %` | 14.24 s | **6.39 s** | 2.2× |
+| 1 image → `− 40 %` | 1.29 s | 0.99 s | 1.3× |
+
+Three things get the speedup:
+
+- **Files run in parallel**, one worker per core.
+- **Metadata uses `identify -ping`**, reading the header instead of decoding the
+  pixels — about 20× faster, and it still reports EXIF orientation.
+- **The byte-target search fans out.** Hitting a size target means repeatedly
+  re-encoding to see how big the result is. Cores left idle once every file has
+  a worker are spent probing several quality settings at once, collapsing the
+  search range by a factor of (fan + 1) per round instead of 2. When there are
+  more files than cores this automatically drops back to a plain bisection, so a
+  saturated machine does not burn encodes it has no spare capacity to absorb.
+
+Single-image size targets gain least, since there is only one file to spread and
+the probes are already parallel. Large PNGs are the slowest case: a byte target
+on a lossless format needs a full re-encode per probe, and at 15 MB each of those
+costs ~0.6 s no matter what compression level is used.
+
+Caching the decode between probes (ImageMagick's MPC format) was tried and
+**rejected** — it halves CPU time but produced no wall-clock gain once probes run
+in parallel, while costing ~90 MB of scratch per image.
+
 ## Customising the presets
 
 Edit the `PRESETS` list at the top of `cosmic-image-resize`:
